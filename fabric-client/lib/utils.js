@@ -16,15 +16,13 @@
 
 'use strict';
 
-var fs = require('fs');
-var tar = require('tar-fs');
-var grpc = require('grpc');
-var path = require('path');
-var zlib = require('zlib');
-var urlParser = require('url');
+var util = require('util');
 var winston = require('winston');
-var Config = require('./Config.js');
+var fs = require('fs-extra');
 var crypto = require('crypto');
+var path = require('path');
+var os = require('os');
+var Config = require('./Config.js');
 
 //
 // Load required crypto stuff.
@@ -36,12 +34,64 @@ var sha3_256 = require('js-sha3').sha3_256;
 // The following methods are for loading the proper implementation of an extensible APIs.
 //
 
-module.exports.getCryptoSuite = function(kvs) {
-	// expecting a path to an alternative implementation
-	var csEnv = this.getConfigSetting('crypto-suite');
-	var cryptoSuite = require(csEnv);
-	var keySize = this.getConfigSetting('crypto-keysize');
-	return new cryptoSuite(keySize, kvs);
+// returns a new instance of the CryptoSuite API implementation
+//
+// @param {Object} setting This optional parameter is an object with the following optional properties:
+// 	- software {boolean}: Whether to load a software-based implementation (true) or HSM implementation (false)
+//		default is true (for software based implementation), specific implementation module is specified
+//		in the setting 'crypto-suite-software'
+//  - keysize {number}: The key size to use for the crypto suite instance. default is value of the setting 'crypto-keysize'
+//  - algorithm {string}: Digital signature algorithm, currently supporting ECDSA only with value "EC"
+//  - hash {string}: 'SHA2' or 'SHA3'
+//
+//
+module.exports.newCryptoSuite = function(setting) {
+	var csImpl, keysize, algorithm, hashAlgo, opts = null;
+
+	var useHSM = false;
+	if (setting && typeof setting.software === 'boolean') {
+		useHSM = !setting.software;
+	} else {
+		useHSM = this.getConfigSetting('crypto-hsm');
+	}
+
+	csImpl = useHSM ? this.getConfigSetting('crypto-suite-hsm') : this.getConfigSetting('crypto-suite-software');
+
+	// this function supports the following:
+	// - newCryptoSuite({software: true, keysize: 256, algorithm: EC})
+	// - newCryptoSuite({software: false, lib: '/usr/local/bin/pkcs11.so', slot: 0, pin: '1234'})
+	// - newCryptoSuite({keysize: 384})
+	// - newCryptoSuite()
+
+	// step 1: what's the cryptosuite impl to use, key size and algo
+	if (setting && setting.keysize && typeof setting === 'object' && typeof setting.keysize === 'number') {
+		keysize = setting.keysize;
+	} else
+		keysize = this.getConfigSetting('crypto-keysize');
+
+	if (setting && setting.algorithm && typeof setting === 'object' && typeof setting.algorithm === 'string') {
+		algorithm = setting.algorithm.toUpperCase();
+	} else
+		algorithm = 'EC';
+
+	if (setting && setting.hash && typeof setting === 'object' && typeof setting.hash === 'string') {
+		hashAlgo = setting.hash.toUpperCase();
+	} else
+		hashAlgo = null;
+
+	// csImpl at this point should be a map (see config/default.json) with keys being the algorithm
+	csImpl = csImpl[algorithm];
+
+	if (!csImpl)
+		throw new Error(util.format('Desired CryptoSuite module not found supporting algorithm "%s"', algorithm));
+
+	var cryptoSuite = require(csImpl);
+
+	// the 'opts' argument to be passed or none at all
+	opts = (typeof setting === 'undefined') ? null : setting;
+
+	//opts Option is the form { lib: string, slot: number, pin: string }
+	return new cryptoSuite(keysize, hashAlgo, opts);
 };
 
 // Provide a Promise-based keyValueStore for couchdb, etc.
@@ -49,7 +99,7 @@ module.exports.newKeyValueStore = function(options) {
 	// initialize the correct KeyValueStore
 	var self = this;
 	return new Promise(function(resolve, reject) {
-		var kvsEnv = self.getConfigSetting('key-value-store','./impl/FileKeyValueStore.js');
+		var kvsEnv = self.getConfigSetting('key-value-store');
 		var store = require(kvsEnv);
 		return resolve(new store(options));
 	});
@@ -160,7 +210,7 @@ module.exports.getLogger = function(name) {
 			}
 
 			var logger = new winston.Logger(options);
-			logger.info('Successfully constructed a winston logger with configurations', config);
+			logger.debug('Successfully constructed a winston logger with configurations', config);
 			saveLogger(logger);
 			return insertLoggerName(logger, name);
 		} catch(err) {
@@ -175,7 +225,7 @@ module.exports.getLogger = function(name) {
 
 	var logger = newDefaultLogger();
 	saveLogger(logger);
-	logger.info('Returning a new winston logger with default configurations');
+	logger.debug('Returning a new winston logger with default configurations');
 	return insertLoggerName(logger, name);
 };
 
@@ -220,88 +270,34 @@ module.exports.getConfig = function() {
 	return config;
 };
 
+// this is a per-application map of msp managers for each channel
+var mspManagers = {};
+
 //
-// generateTarGz creates a .tar.gz file from contents in the src directory and
-// saves them in a dest file.
+// returns the MSP manager responsible for the given channel
 //
-module.exports.generateTarGz = function(src, dest) {
-	// A list of file extensions that should be packaged into the .tar.gz.
-	// Files with all other file extenstions will be excluded to minimize the size
-	// of the deployment transaction payload.
-	var keep = [
-		'.go',
-		'.yaml',
-		'.json',
-		'.c',
-		'.h'
-	];
+module.exports.getMSPManager = function(channelId) {
+	var mspm = mspManagers[channelId];
+	if (mspm === null) {
+		// this is a rather catastrophic error, without an MSP manager not much can continue
+		throw new Error(util.format('Can not find an MSP Manager for the given channel ID: %s', channelId));
+	}
 
-	return new Promise(function(resolve, reject) {
-		// Create the pack stream specifying the ignore/filtering function
-		var pack = tar.pack(src, {
-			ignore: function(name) {
-				// Check whether the entry is a file or a directory
-				if (fs.statSync(name).isDirectory()) {
-					// If the entry is a directory, keep it in order to examine it further
-					return false;
-				} else {
-					// If the entry is a file, check to see if it's the Dockerfile
-					if (name.indexOf('Dockerfile') > -1) {
-						return false;
-					}
-
-					// If it is not the Dockerfile, check its extension
-					var ext = path.extname(name);
-
-					// Ignore any file who's extension is not in the keep list
-					if (keep.indexOf(ext) === -1) {
-						return true;
-					} else {
-						return false;
-					}
-				}
-			}
-		})
-		.pipe(zlib.Gzip())
-		.pipe(fs.createWriteStream(dest));
-
-		pack.on('close', function() {
-			return resolve(dest);
-		});
-		pack.on('error', function() {
-			return reject(new Error('Error on fs.createWriteStream'));
-		});
-	});
+	return mspm;
 };
 
-
+//
+// registers an MSP manager using the channelId as the key
+//
+module.exports.addMSPManager = function(channelId, mspm) {
+	mspManagers[channelId] = mspm;
+};
 
 //
-// The Endpoint class represents a remote grpc or grpcs target
+// unregisters the MSP manager for the given channelId
 //
-module.exports.Endpoint = class {
-	constructor(url /*string*/ , pem /*string*/ ) {
-		var purl = urlParser.parse(url, true);
-		var protocol;
-		if (purl.protocol) {
-			protocol = purl.protocol.toLowerCase().slice(0, -1);
-		}
-		if (protocol === 'grpc') {
-			this.addr = purl.host;
-			this.creds = grpc.credentials.createInsecure();
-		} else if (protocol === 'grpcs') {
-			if(!(typeof pem === 'string')) {
-				throw new Error('PEM encoded certificate is required.');
-			}
-			this.addr = purl.host;
-			this.creds = grpc.credentials.createSsl(new Buffer(pem));
-		} else {
-			var error = new Error();
-			error.name = 'InvalidProtocol';
-			error.message = 'Invalid protocol: ' + protocol + '.  URLs must begin with grpc:// or grpcs://';
-			throw error;
-		}
-	}
+module.exports.removeMSPManager = function(channelId) {
+	delete mspManagers[channelId];
 };
 
 //
@@ -354,33 +350,6 @@ module.exports.toArrayBuffer = function(buffer) {
 	return ab;
 };
 
-// utility function to check if directory or file exists
-// uses entire / absolute path from root
-module.exports.existsSync = function(absolutePath /*string*/) {
-	try  {
-		var stat = fs.statSync(absolutePath);
-		if (stat.isDirectory() || stat.isFile()) {
-			return true;
-		} else
-			return false;
-	}
-	catch (e) {
-		return false;
-	}
-};
-
-// utility function to build an unique transaction id
-// The request object may contain values that could be
-// used to help generate the result value
-module.exports.buildTransactionID = function(request /*object*/) {
-	var length = 10;
-	if(request && request.length) {
-		length = request.length;
-	}
-	var value = crypto.randomBytes(10); //TODO how should we really generate this value
-	return value;
-};
-
 // utility function to create a random number of
 // the specified length.
 module.exports.getNonce = function(length) {
@@ -406,4 +375,124 @@ module.exports.getClassMethods = function(clazz) {
 			if (e !== 'constructor' && typeof i[e] === 'function')
 				return true;
 		});
+};
+
+module.exports.getBufferBit = function(buf, idx, val) {
+	// return error=true if bit to mask exceeds buffer length
+	if ((parseInt(idx/8) + 1) > buf.length) {
+		return { error: true, invalid: 0} ;
+	}
+	if ((buf[parseInt(idx/8)] & (1<<(idx%8))) != 0) {
+		return { error: false, invalid: 1};
+	} else {
+		return { error: false, invalid: 0};
+	}
+};
+
+module.exports.readFile = function(path) {
+	return new Promise(function(resolve, reject) {
+		fs.readFile(path, function(err, data) {
+			if (err) {
+				reject(err);
+			} else {
+				resolve(data);
+			}
+		});
+	});
+};
+
+module.exports.getDefaultKeyStorePath = function() {
+	return path.join(os.homedir(), '.hfc-key-store');
+};
+
+var CryptoKeyStore = function(KVSImplClass, opts) {
+	this.logger = module.exports.getLogger('utils.CryptoKeyStore');
+	this.logger.debug('CryptoKeyStore, constructor - start');
+	if (KVSImplClass && typeof opts === 'undefined') {
+		if (typeof KVSImplClass === 'function') {
+			// the super class module was passed in, but not the 'opts'
+			opts = null;
+		} else {
+			// called with only one argument for the 'opts' but KVSImplClass was skipped
+			opts = KVSImplClass;
+			KVSImplClass = null;
+		}
+	}
+
+	if (typeof opts === 'undefined' || opts === null) {
+		opts = {
+			path: module.exports.getDefaultKeyStorePath()
+		};
+	}
+	var superClass;
+	if (typeof KVSImplClass !== 'undefined' && KVSImplClass !== null) {
+		superClass = KVSImplClass;
+	} else {
+		// no super class specified, use the default key value store implementation
+		superClass = require(module.exports.getConfigSetting('key-value-store'));
+		this.logger.debug('constructor, no super class specified, using config: '+module.exports.getConfigSetting('key-value-store'));
+	}
+
+	this._store = null;
+	this._storeConfig = {
+		superClass: superClass,
+		opts: opts
+
+	};
+
+	this._getKeyStore = function() {
+		var CKS = require('./impl/CryptoKeyStore.js');
+
+		var self = this;
+		return new Promise((resolve, reject) => {
+			if (self._store === null) {
+				self.logger.debug(util.format('This class requires a CryptoKeyStore to save keys, using the store: %j', self._storeConfig));
+
+				CKS(self._storeConfig.superClass, self._storeConfig.opts)
+				.then((ks) => {
+					self.logger.debug('_getKeyStore returning ks');
+					self._store = ks;
+					return resolve(self._store);
+				}).catch((err) => {
+					reject(err);
+				});
+			} else {
+				self.logger.debug('_getKeyStore resolving store');
+				return resolve(self._store);
+			}
+		});
+	};
+
+};
+
+module.exports.newCryptoKeyStore = function(KVSImplClass, opts) {
+	// this function supports skipping any of the arguments such that it can be called in any of the following fashions:
+	// - newCryptoKeyStore(CouchDBKeyValueStore, {name: 'member_db', url: 'http://localhost:5984'})
+	// - newCryptoKeyStore({path: '/tmp/app-state-store'})
+	// - newCryptoKeyStore()
+	return new CryptoKeyStore(KVSImplClass, opts);
+};
+
+/*
+ * This function will create a new key value pair type options object based
+ * on the one passed in. The option setting will be added to the options if it
+ * does not exist in the options already. The value of the new setting will be the default
+ * value passed in unless there is a value in the config settings
+ */
+module.exports.checkAndAddConfigSetting = function(option_name, default_value, options) {
+	var return_options = {};
+	return_options[option_name] = module.exports.getConfigSetting(option_name, default_value);
+	var found_option = false;
+	if(options) {
+		var keys = Object.keys(options);
+		for(var i in keys) {
+			let key = keys[i];
+			var value = options[key];
+			if(key === option_name) {
+				found_option = true;
+			}
+			return_options[key] = value;
+		}
+	}
+	return return_options;
 };

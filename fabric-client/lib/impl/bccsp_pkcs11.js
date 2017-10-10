@@ -42,10 +42,18 @@ var __func = function() {
 		'[' + callsite()[1].getLineNumber() + ']: ';
 };
 
+/**
+ * PKCS#11-compliant implementation to support Hardware Security Modules.
+ *
+ * @class
+ * @extends module:api.CryptoSuite
+ */
 var CryptoSuite_PKCS11 = class extends api.CryptoSuite {
 
-	/*
-	 * Option is the form { lib: string, slot: number, pin: string }
+	/**
+	 * @param {number} keySize Length of key (in bytes), a.k.a "security level"
+	 * @param {string} hash Optional. Hash algorithm, supported values are "SHA2" and "SHA3"
+	 * @param {Object} opts Option is the form { lib: string, slot: number, pin: string }
 	 *
 	 * If lib is not specified or null, its value will be taken from the
 	 * CRYPTO_PKCS11_LIB env var, and if the env var is not set, its value will
@@ -59,7 +67,7 @@ var CryptoSuite_PKCS11 = class extends api.CryptoSuite {
 	 * CRYPTO_PKCS11_PIN env var, and if the env var is not set, its value will
 	 * be taken from the crypto-pkcs11-pin key in the configuration file.
 	 */
-	constructor(keySize, opts) {
+	constructor(keySize, hash, opts) {
 		if (typeof keySize === 'undefined' || keySize === null)
 			throw new Error(__func() + 'keySize must be specified');
 		if (typeof keySize === 'string') keySize = parseInt(keySize, 10);
@@ -70,7 +78,7 @@ var CryptoSuite_PKCS11 = class extends api.CryptoSuite {
 		/*
 		 * If no lib specified, get it from env var or config file.
 		 */
-		var pkcs11Lib = opts.lib;
+		var pkcs11Lib = opts? opts.lib : null;
 		if (typeof pkcs11Lib === 'undefined' || pkcs11Lib === null)
 			pkcs11Lib = utils.getConfigSetting('crypto-pkcs11-lib');
 		if (typeof pkcs11Lib === 'undefined' || pkcs11Lib === null ||
@@ -153,6 +161,8 @@ var CryptoSuite_PKCS11 = class extends api.CryptoSuite {
 	 * Open pkcs11 session and login.
 	 */
 	_pkcs11OpenSession(pkcs11, pkcs11Lib, pkcs11Slot, pkcs11Pin) {
+		logger.debug(__func() + 'parameters are pkcs11Slot %s pkcs11Pin %s pkcs11Lib %s',
+			pkcs11Slot, pkcs11Pin, pkcs11Lib);
 		pkcs11.load(pkcs11Lib);
 		pkcs11.C_Initialize();
 
@@ -679,7 +689,7 @@ var CryptoSuite_PKCS11 = class extends api.CryptoSuite {
 	 * is (are) ephemeral unless opts.ephemeral is set to false, in which case the
 	 * key (keypair) will be saved across PKCS11 sessions by the HSM hardware.
 	 *
-	 * @returns {Key} Promise of an instance of {@link module:PKCS11_ECDSA_KEY}
+	 * @returns {module:api.Key} Promise of an instance of {@link module:PKCS11_ECDSA_KEY}
 	 * containing the private key and the public key.
 	 */
 	generateKey(opts) {

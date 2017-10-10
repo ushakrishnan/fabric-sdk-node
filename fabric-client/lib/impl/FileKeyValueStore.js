@@ -28,13 +28,14 @@ var logger = utils.getLogger('FileKeyValueStore.js');
  * It uses files to store the key values.
  *
  * @class
+ * @extends module:api.KeyValueStore
  */
-var KeyValueStore = class extends api.KeyValueStore {
+var FileKeyValueStore = class extends api.KeyValueStore {
 
 	/**
 	 * constructor
 	 *
-	 * @param {Object} options contains a single property 'path' which points to the top-level directory
+	 * @param {Object} options contains a single property <code>path</code> which points to the top-level directory
 	 * for the store
 	 */
 	constructor(options) {
@@ -53,23 +54,13 @@ var KeyValueStore = class extends api.KeyValueStore {
 			fs.mkdirs(self._dir, function (err) {
 				if (err) {
 					logger.debug('FileKeyValueStore.js - constructor, error creating directory, code: ' + err.code);
-					if (err.code == 'EEXIST') {
-						return resolve(self);
-					} else {
-						return reject(err.code);
-					}
+					return reject(err);
 				}
 				return resolve(self);
 			});
 		});
 	}
 
-	/**
-	 * Get the value associated with name.
-	 * @param {string} name
-	 * @returns Promise for the value
-	 * @ignore
-	 */
 	getValue(name) {
 		logger.debug('FileKeyValueStore -- getValue');
 
@@ -90,13 +81,6 @@ var KeyValueStore = class extends api.KeyValueStore {
 		});
 	}
 
-	/**
-	 * Set the value associated with name.
-	 * @param {string} name
-	 * @param {string} value
-	 * @returns Promise for a "true" value on successful completion
-	 * @ignore
-	 */
 	setValue(name, value) {
 		logger.debug('FileKeyValueStore -- setValue');
 
@@ -115,4 +99,4 @@ var KeyValueStore = class extends api.KeyValueStore {
 	}
 };
 
-module.exports = KeyValueStore;
+module.exports = FileKeyValueStore;

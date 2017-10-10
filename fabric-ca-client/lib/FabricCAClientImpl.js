@@ -18,72 +18,129 @@
 
 var api = require('./api.js');
 var utils = require('./utils.js');
+var BaseClient = require('./BaseClient.js');
 var util = require('util');
-var jsrsa = require('jsrsasign');
-var asn1 = jsrsa.asn1;
 var path = require('path');
 var http = require('http');
 var https = require('https');
 var urlParser = require('url');
-
+var jsrsasign = require('jsrsasign');
+var x509 = jsrsasign.X509;
+var ASN1HEX = jsrsasign.ASN1HEX;
 
 var logger = utils.getLogger('FabricCAClientImpl.js');
 
 /**
+ * @typedef {Object} TLSOptions
+ * @property {string[]} trustedRoots Array of PEM-encoded trusted root certificates
+ * @property {boolean} [verify=true] Determines whether or not to verify the server certificate when using TLS
+ */
+
+/**
  * This is an implementation of the member service client which communicates with the Fabric CA server.
  * @class
+ * @extends BaseClient
  */
-var FabricCAServices = class {
+var FabricCAServices = class extends BaseClient {
 
 	/**
 	 * constructor
 	 *
 	 * @param {string} url The endpoint URL for Fabric CA services of the form: "http://host:port" or "https://host:port"
-	 * @param {KeyValueStore} kvs KeyValueStore for CryptoSuite
+	 * @param {TLSOptions} tlsOptions The TLS settings to use when the Fabric CA services endpoint uses "https"
+	 * @param {string} caName The optional name of the CA. Fabric-ca servers support multiple Certificate Authorities from
+	 *  a single server. If omitted or null or an empty string, then the default CA is the target of requests
+	 * @param {CryptoSuite} cryptoSuite The optional cryptoSuite instance to be used if options other than defaults are needed.
+	 * If not specified, an instance of {@link CryptoSuite} will be constructed based on the current configuration settings:
+	 * <br> - crypto-hsm: use an implementation for Hardware Security Module (if set to true) or software-based key management (if set to false)
+	 * <br> - crypto-keysize: security level, or key size, to use with the digital signature public key algorithm. Currently ECDSA
+	 *  is supported and the valid key sizes are 256 and 384
+	 * <br> - crypto-hash-algo: hashing algorithm
+	 * <br> - key-value-store: some CryptoSuite implementation requires a key store to persist private keys. A {@link CryptoKeyStore}
+	 *  is provided for this purpose, which can be used on top of any implementation of the {@link KeyValueStore} interface,
+	 *  such as a file-based store or a database-based one. The specific implementation is determined by the value of this configuration setting.
 	 */
-	constructor(url, kvs) {
+	constructor(url, tlsOptions, caName, cryptoSuite) {
+		super();
 
 		var endpoint = FabricCAServices._parseURL(url);
 
+		if (!!cryptoSuite) {
+			this.setCryptoSuite(cryptoSuite);
+		} else {
+			this.setCryptoSuite(utils.newCryptoSuite());
+			this.getCryptoSuite().setCryptoKeyStore(utils.newCryptoKeyStore());
+		}
+
 		this._fabricCAClient = new FabricCAClient({
+			caname: caName,
 			protocol: endpoint.protocol,
 			hostname: endpoint.hostname,
-			port: endpoint.port
-		});
+			port: endpoint.port,
+			tlsOptions: tlsOptions
+		}, this.getCryptoSuite());
 
-		this.cryptoPrimitives = utils.getCryptoSuite(kvs);
-
-		logger.info('Successfully constructed Fabric CA service client: endpoint - %j', endpoint);
+		logger.debug('Successfully constructed Fabric CA service client: endpoint - %j', endpoint);
 
 	}
-
-	getCrypto() {
-		return this.cryptoPrimitives;
-	}
+	/**
+	 * @typedef {Object} RegisterRequest
+	 * @property {string} enrollmentID - ID which will be used for enrollment
+	 * @property {string} enrollmentSecret - Optional enrollment secret to set for the registered user.
+	 *                    If not provided, the server will generate one.
+	 * @property {string} role - Optional arbitrary string representing a role value for the user
+	 * @property {string} affiliation - Affiliation with which this user will be associated,
+	 *                    like a company or an organization
+	 * @property {number} maxEnrollments - The maximum number of times this user will be permitted to enroll
+	 * @property {KeyValueAttribute[]} attrs - Array of {@link KeyValueAttribute} attributes to assign to the user
+	 */
 
 	/**
 	 * Register the member and return an enrollment secret.
-	 * @param {Object} req Registration request with the following fields: enrollmentID, roles, registrar
-	 * @param {Member} registrar The identity of the registrar (i.e. who is performing the registration)
-	 * @returns Promise for the enrollmentSecret
-	 * @ignore
+	 * @param {RegisterRequest} req - The {@link RegisterRequest}
+	 * @param registrar {User}. The identity of the registrar (i.e. who is performing the registration)
+	 * @returns {Promise} The enrollment secret to use when this user enrolls
 	 */
 	register(req, registrar) {
-		var self = this;
+		if (typeof req === 'undefined' || req === null) {
+			throw new Error('Missing required argument "request"');
+		}
 
+		if (typeof req.enrollmentID === 'undefined' || req.enrollmentID === null) {
+			throw new Error('Missing required argument "request.enrollmentID"');
+		}
+
+		if (typeof req.maxEnrollments === 'undefined' || req.maxEnrollments === null) {
+			// set maxEnrollments to 1
+			req.maxEnrollments = 1;
+		}
+
+		checkRegistrar(registrar);
+
+		return this._fabricCAClient.register(req.enrollmentID, req.enrollmentSecret, req.role, req.affiliation, req.maxEnrollments, req.attrs,
+			registrar.getSigningIdentity());
 	}
 
 	/**
+	 * @typedef {Object} EnrollmentRequest
+	 * @property {string} enrollmentID - The registered ID to use for enrollment
+	 * @property {string} enrollmentSecret - The secret associated with the enrollment ID
+	 * @property {AttributeRequest[]} attr_reqs - An array of {@link AttributeRequest}
+	 */
+
+	/**
 	 * Enroll the member and return an opaque member object.
-	 * @param req Enrollment request
-	 * @param {string} req.enrollmentID The registered ID to use for enrollment
-	 * @param {string} req.enrollmentSecret The secret associated with the enrollment ID
+	 * @param req the {@link EnrollmentRequest}
 	 * @returns Promise for an object with "key" for private key and "certificate" for the signed certificate
 	 */
 	enroll(req) {
 		var self = this;
 
 		return new Promise(function (resolve, reject) {
+			if (typeof req === 'undefined' || req === null) {
+				logger.error('enroll() missing required argument "request"');
+				return reject(new Error('Missing required argument "request"'));
+			}
 			if (!req.enrollmentID) {
 				logger.error('Invalid enroll request, missing enrollmentID');
 				return reject(new Error('req.enrollmentID is not set'));
@@ -94,22 +151,41 @@ var FabricCAServices = class {
 				return reject(new Error('req.enrollmentSecret is not set'));
 			}
 
-			var enrollmentID = req.enrollmentID;
-			var enrollmentSecret = req.enrollmentSecret;
+			if(req.attr_reqs) {
+				if(!Array.isArray(req.attr_reqs)) {
+					logger.error('Invalid enroll request, attr_reqs must be an array of AttributeRequest objects');
+					return reject(new Error('req.attr_reqs is not an array'));
+				} else {
+					for(let i in req.attr_reqs) {
+						let attr_req = req.attr_reqs[i];
+						if(!attr_req.name) {
+							logger.error('Invalid enroll request, attr_reqs object is missing the name of the attribute');
+							return reject(new Error('req.att_regs is missing the attribute name'));
+						}
+					}
+				}
+			}
 
 			//generate enrollment certificate pair for signing
-			self.cryptoPrimitives.generateKey()
+			var opts;
+			if (self.getCryptoSuite()._cryptoKeyStore) {
+				opts = {ephemeral: false};
+			} else {
+				opts = {ephemeral: true};
+			}
+			self.getCryptoSuite().generateKey(opts)
 				.then(
 				function (privateKey) {
 					//generate CSR using enrollmentID for the subject
 					try {
 						var csr = privateKey.generateCSR('CN=' + req.enrollmentID);
-						self._fabricCAClient.enroll(req.enrollmentID, req.enrollmentSecret, csr)
+						self._fabricCAClient.enroll(req.enrollmentID, req.enrollmentSecret, csr, req.attr_reqs)
 							.then(
-							function (csrPEM) {
+							function (enrollResponse) {
 								return resolve({
 									key: privateKey,
-									certificate: csrPEM
+									certificate: enrollResponse.enrollmentCert,
+									rootCertificate: enrollResponse.caCertChain
 								});
 							},
 							function (err) {
@@ -130,7 +206,127 @@ var FabricCAServices = class {
 	}
 
 	/**
-	 * @typedef {Object} FabricCAServices-HTTPEndpoint
+	 * Re-enroll the member in cases such as the existing enrollment certificate is about to expire, or
+	 * it has been compromised
+	 * @param {User} currentUser The identity of the current user that holds the existing enrollment certificate
+	 * @param {AttributeRequest[]} Optional an array of {@link AttributeRequest} that indicate attributes to
+	 *                             be included in the certificate
+	 * @returns Promise for an object with "key" for private key and "certificate" for the signed certificate
+	 */
+	reenroll(currentUser, attr_reqs) {
+		if (!currentUser) {
+			logger.error('Invalid re-enroll request, missing argument "currentUser"');
+			throw new Error('Invalid re-enroll request, missing argument "currentUser"');
+		}
+
+		if (typeof currentUser.getIdentity !== 'function') {
+			logger.error('Invalid re-enroll request, "currentUser" is not a valid User object, missing "getIdentity()" method');
+			throw new Error('Invalid re-enroll request, "currentUser" is not a valid User object, missing "getIdentity()" method');
+		}
+
+		if (typeof currentUser.getSigningIdentity !== 'function') {
+			logger.error('Invalid re-enroll request, "currentUser" is not a valid User object, missing "getSigningIdentity()" method');
+			throw new Error('Invalid re-enroll request, "currentUser" is not a valid User object, missing "getSigningIdentity()" method');
+		}
+		if(attr_reqs) {
+			if(!Array.isArray(attr_reqs)) {
+				logger.error('Invalid re-enroll request, attr_reqs must be an array of AttributeRequest objects');
+				throw new Error('Invalid re-enroll request, attr_reqs must be an array of AttributeRequest objects');
+			} else {
+				for(let i in attr_reqs) {
+					let attr_req = attr_reqs[i];
+					if(!attr_req.name) {
+						logger.error('Invalid re-enroll request, attr_reqs object is missing the name of the attribute');
+						throw new Error('Invalid re-enroll request, attr_reqs object is missing the name of the attribute');
+					}
+				}
+			}
+		}
+
+		var cert = currentUser.getIdentity()._certificate;
+		var subject = null;
+		try {
+			subject = getSubjectCommonName(FabricCAServices.normalizeX509(cert));
+		} catch(err) {
+			logger.error(util.format('Failed to parse enrollment certificate %s for Subject. \nError: %s', cert, err));
+		}
+
+		if (subject === null)
+			throw new Error('Failed to parse the enrollment certificate of the current user for its subject');
+
+		var self = this;
+
+		return new Promise(function (resolve, reject) {
+			//generate enrollment certificate pair for signing
+			self.getCryptoSuite().generateKey()
+				.then(
+				function (privateKey) {
+					//generate CSR using the subject of the current user's certificate
+					try {
+						var csr = privateKey.generateCSR('CN=' + subject);
+						self._fabricCAClient.reenroll(csr, currentUser.getSigningIdentity(), attr_reqs)
+							.then(
+							function (response) {
+								return resolve({
+									key: privateKey,
+									certificate: Buffer.from(response.result.Cert, 'base64').toString(),
+									rootCertificate: Buffer.from(response.result.ServerInfo.CAChain, 'base64').toString()
+								});
+							},
+							function (err) {
+								return reject(err);
+							}
+							);
+
+					} catch (err) {
+						return reject(new Error(util.format('Failed to generate CSR for enrollmemnt due to error [%s]', err)));
+					}
+				},
+				function (err) {
+					return reject(new Error(util.format('Failed to generate key for enrollment due to error [%s]', err)));
+				}
+				);
+
+		});
+	}
+
+	/**
+	 * Revoke an existing certificate (enrollment certificate or transaction certificate), or revoke
+	 * all certificates issued to an enrollment id. If revoking a particular certificate, then both
+	 * the Authority Key Identifier and serial number are required. If revoking by enrollment id,
+	 * then all future requests to enroll this id will be rejected.
+	 * @param {Object} request Request object with the following fields:
+	 * <br> - enrollmentID {string}. ID to revoke
+	 * <br> - aki {string}. Authority Key Identifier string, hex encoded, for the specific certificate to revoke
+	 * <br> - serial {string}. Serial number string, hex encoded, for the specific certificate to revoke
+	 * <br> - reason {string}. The reason for revocation. See https://godoc.org/golang.org/x/crypto/ocsp
+	 *  for valid values. The default value is 0 (ocsp.Unspecified).
+	 * @param {User} registrar The identity of the registrar (i.e. who is performing the revocation)
+	 * @returns {Promise} The revocation results
+	 */
+	revoke(request, registrar) {
+		if (typeof request === 'undefined' || request === null) {
+			throw new Error('Missing required argument "request"');
+		}
+
+		if (request.enrollmentID === null || request.enrollmentID === '') {
+			if (request.aki === null || request.aki === '' || request.serial === null || request.serial === '') {
+				throw new Error('Enrollment ID is empty, thus both "aki" and "serial" must have non-empty values');
+			}
+		}
+
+		checkRegistrar(registrar);
+
+		return this._fabricCAClient.revoke(
+			request.enrollmentID,
+			request.aki,
+			request.serial,
+			(request.reason) ? request.reason : null,
+			registrar.getSigningIdentity());
+	}
+
+	/**
+	 * @typedef {Object} HTTPEndpoint
 	 * @property {string} hostname
 	 * @property {number} port
 	 * @property {string} protocol
@@ -139,7 +335,7 @@ var FabricCAServices = class {
 	/**
 	 * Utility function which parses an HTTP URL into its component parts
 	 * @param {string} url HTTP or HTTPS url including protocol, host and port
-	 * @returns {...FabricCAServices-HTTPEndpoint}
+	 * @returns {HTTPEndpoint}
 	 * @throws InvalidURL for malformed URLs
 	 * @ignore
 	 */
@@ -183,6 +379,29 @@ var FabricCAServices = class {
 			', port: ' + this._fabricCAClient._port +
 			'}';
 	}
+
+	/**
+	 * Make sure there's a start line with '-----BEGIN CERTIFICATE-----'
+	 * and end line with '-----END CERTIFICATE-----', so as to be compliant
+	 * with x509 parsers
+	 */
+	static normalizeX509(raw) {
+		var regex = /(\-\-\-\-\-\s*BEGIN ?[^-]+?\-\-\-\-\-)([\s\S]*)(\-\-\-\-\-\s*END ?[^-]+?\-\-\-\-\-)/;
+		var matches = raw.match(regex);
+		if (matches.length !== 4) {
+			throw new Error('Failed to find start line or end line of the certificate.');
+		}
+
+		// remove the first element that is the whole match
+		matches.shift();
+		// remove LF or CR
+		matches = matches.map((element) => {
+			return element.trim();
+		});
+
+		// make sure '-----BEGIN CERTIFICATE-----' and '-----END CERTIFICATE-----' are in their own lines
+		return matches.join('\n');
+	}
 };
 
 /**
@@ -193,24 +412,19 @@ var FabricCAServices = class {
 var FabricCAClient = class {
 
 	/**
-	 * @typedef {Object} FabricCAServices-HTTPEndpoint
-	 * @property {string} hostname
-	 * @property {number} port
-	 * @property {boolean} isSecure
-	 */
-
-	/**
 	 * constructor
 	 *
 	 * @param {object} connect_opts Connection options for communciating with the Fabric CA server
 	 * @param {string} connect_opts.protocol The protocol to use (either HTTP or HTTPS)
 	 * @param {string} connect_opts.hostname The hostname of the Fabric CA server endpoint
 	 * @param {number} connect_opts.port The port of the Fabric CA server endpoint
-	 * @param {Buffer[]} connect_opts.ca An array of trusted certificates in PEM format
+	 * @param {TLSOptions} connect_opts.tlsOptions The TLS settings to use when the Fabric CA endpoint uses "https"
+	 * @param {string} connect_opts.caname The optional name of the CA. Fabric-ca servers support multiple Certificate Authorities from
+	 *  a single server. If omitted or null or an empty string, then the default CA is the target of requests
 	 * @throws Will throw an error if connection options are missing or invalid
 	 *
 	 */
-	constructor(connect_opts) {
+	constructor(connect_opts, cryptoPrimitives) {
 
 		//check connect_opts
 		try {
@@ -219,63 +433,188 @@ var FabricCAClient = class {
 			throw new Error('Invalid connection options.  ' + err.message);
 		}
 
-
-		this._httpClient = (connect_opts.protocol = 'http') ? http : https;
+		this._caName = connect_opts.caname,
+		this._httpClient = (connect_opts.protocol === 'http') ? http : https;
 		this._hostname = connect_opts.hostname;
 		if (connect_opts.port) {
 			this._port = connect_opts.port;
 		} else {
-			this._port = (connect_opts.protocol === 'http' ? 80 : 443);
+			this._port = 7054;
 		}
-		this._ca = (connect_opts.ca) ? connect_opts.ca : null;
-		this._baseAPI = '/api/v1/cfssl/';
+		if (typeof connect_opts.tlsOptions==='undefined' || connect_opts.tlsOptions===null){
+			this._tlsOptions = {
+				trustedRoots: [],
+				verify: false
+			};
+		} else {
+			this._tlsOptions = connect_opts.tlsOptions;
+			if (typeof this._tlsOptions.verify === 'undefined') {
+				this._tlsOptions.verify = true;
+			}
+			if (typeof this._tlsOptions.trustedRoots === 'undefined') {
+				this._tlsOptions.trustedRoots = [];
+			}
+		}
+		this._baseAPI = '/api/v1/';
 
+		this._cryptoPrimitives = cryptoPrimitives;
 
+		logger.debug('Successfully constructed Fabric CA client from options - %j', connect_opts);
 	}
 
 	/**
 	 * @typedef {Object} KeyValueAttribute
-	 * @property {string} key The key used to reference the attribute
+	 * @property {string} name The key used to reference the attribute
 	 * @property {string} value The value of the attribute
 	 */
 
 	/**
 	 * Register a new user and return the enrollment secret
 	 * @param {string} enrollmentID ID which will be used for enrollment
-	 * @param {string} role Type of role for this user
-	 * @param {string} group Group to which this user will be assigned
+	 * @param {string} enrollmentSecret Optional enrollment secret to set for the registered user.
+	 *        If not provided, the server will generate one.
+	 *        When not including, use a null for this parameter.
+	 * @param {string} role Optional type of role for this user.
+	 *        When not including, use a null for this parameter.
+	 * @param {string} affiliation Affiliation with which this user will be associated
+	 * @param {number} maxEnrollments The maximum number of times the user is permitted to enroll
 	 * @param {KeyValueAttribute[]} attrs Array of key/value attributes to assign to the user
-	 * @param {string} callerID The ID of the user who is registering this user
+	 * @param {SigningIdentity} signingIdentity The instance of a SigningIdentity encapsulating the
+	 * signing certificate, hash algorithm and signature algorithm
 	 * @returns {Promise} The enrollment secret to use when this user enrolls
 	 */
-	register(enrollmentID, role, group, attrs, callerID) {
+	register(enrollmentID, enrollmentSecret, role, affiliation, maxEnrollments, attrs, signingIdentity) {
+
+		var self = this;
+		var numArgs = arguments.length;
+		//all arguments are required
+		if (!enrollmentID || !affiliation || !maxEnrollments || !signingIdentity) {
+			throw new Error('Missing required parameters.  \'enrollmentID\', \'affiliation\', \
+				and \'signingIdentity\' are all required.');
+		}
+
+		return new Promise(function (resolve, reject) {
+			var regRequest = {
+				'id': enrollmentID,
+				'affiliation': affiliation,
+				'max_enrollments': maxEnrollments
+			};
+
+			if(role) {
+				regRequest.type = role;
+			}
+
+			if(attrs) {
+				regRequest.attrs = attrs;
+			}
+
+			if (typeof enrollmentSecret === 'string' && enrollmentSecret !== '') {
+				regRequest.secret = enrollmentSecret;
+			}
+
+			return self.post('register', regRequest, signingIdentity)
+			.then(function (response) {
+				return resolve(response.result.secret);
+			}).catch(function (err) {
+				return reject(err);
+			});
+		});
+	}
+
+	/**
+	 * Revoke an existing certificate (enrollment certificate or transaction certificate), or revoke
+	 * all certificates issued to an enrollment id. If revoking a particular certificate, then both
+	 * the Authority Key Identifier and serial number are required. If revoking by enrollment id,
+	 * then all future requests to enroll this id will be rejected.
+	 * @param {string} enrollmentID ID to revoke
+	 * @param {string} aki Authority Key Identifier string, hex encoded, for the specific certificate to revoke
+	 * @param {string} serial Serial number string, hex encoded, for the specific certificate to revoke
+	 * @param {string} reason The reason for revocation. See https://godoc.org/golang.org/x/crypto/ocsp
+	 *  for valid values
+	 * @param {SigningIdentity} signingIdentity The instance of a SigningIdentity encapsulating the
+	 * signing certificate, hash algorithm and signature algorithm
+	 * @returns {Promise} The revocation results
+	 */
+	revoke(enrollmentID, aki, serial, reason, signingIdentity) {
 
 		var self = this;
 		var numArgs = arguments.length;
 
-		return new Promise(function (resolve, reject) {
-			//all arguments are required
-			if (numArgs < 5) {
-				reject(new Error('Missing required parameters.  \'enrollmentID\', \'role\', \'group\', \'attrs\', \
-					and \'callerID\' are all required.'));
-			}
+		//all arguments are required
+		if (numArgs < 5) {
+			throw new Error('Missing required parameters.  \'enrollmentID\', \'aki\', \'serial\', \'reason\', \
+				\'callerID\' and \'signingIdentity\' are all required.');
+		}
 
+		return new Promise(function (resolve, reject) {
 
 			var regRequest = {
 				'id': enrollmentID,
-				'type': role,
-				'group': group,
-				'attrs': attrs,
-				'callerID': callerID
+				'aki': aki,
+				'serial': serial,
+				'reason': reason
 			};
 
+			return self.post('revoke', regRequest, signingIdentity)
+			.then(function (response) {
+				return resolve(response);
+			}).catch(function (err) {
+				return reject(err);
+			});
+		});
+	}
+
+	/**
+	 * Re-enroll an existing user.
+	 * @param {string} csr PEM-encoded PKCS#10 certificate signing request
+	 * @param {SigningIdentity} signingIdentity The instance of a SigningIdentity encapsulating the
+	 * @param {AttributeRequest[]} attr_reqs An array of {@link AttributeRequest}
+	 * @returns {Promise} {@link EnrollmentResponse}
+	 */
+	reenroll(csr, signingIdentity, attr_reqs) {
+
+		var self = this;
+		var numArgs = arguments.length;
+
+		//all arguments are required
+		if (numArgs < 2) {
+			throw new Error('Missing required parameters.  \'csr\', \'signingIdentity\' are all required.');
+		}
+
+		return new Promise(function (resolve, reject) {
+
+			var request = {
+				certificate_request: csr
+			};
+
+			if(attr_reqs) {
+				request.attr_reqs = attr_reqs;
+			}
+
+			return self.post('reenroll', request, signingIdentity)
+			.then(function (response) {
+				return resolve(response);
+			}).catch(function (err) {
+				return reject(err);
+			});
+		});
+	}
+
+	post(api_method, requestObj, signingIdentity) {
+		requestObj.caName = this._caName;
+
+		var self = this;
+		return new Promise(function (resolve, reject) {
 			var requestOptions = {
 				hostname: self._hostname,
 				port: self._port,
-				path: self._baseAPI + 'register',
+				path: self._baseAPI + api_method,
 				method: 'POST',
-				//auth: enrollmentID + ':' + enrollmentSecret,
-				ca: self._ca
+				headers: {
+					Authorization: self.generateAuthToken(requestObj, signingIdentity)
+				},
+				ca: self._tlsOptions.trustedRoots,
+				rejectUnauthorized: self._tlsOptions.verify
 			};
 
 			var request = self._httpClient.request(requestOptions, function (response) {
@@ -291,56 +630,77 @@ var FabricCAClient = class {
 
 					if (!payload) {
 						reject(new Error(
-							util.format('Registerfailed with HTTP status code ', response.statusCode)));
+							util.format('fabric-ca request %s failed with HTTP status code %s', api_method, response.statusCode)));
 					}
 					//response should be JSON
+					var responseObj;
 					try {
-						var regResponse = JSON.parse(payload);
-						if (regResponse.success) {
-							//we want the result field which is Base64-encoded PEM
-							return resolve(regResponse.result);
+						responseObj = JSON.parse(payload);
+						if (responseObj.success) {
+							return resolve(responseObj);
 						} else {
 							return reject(new Error(
-								util.format('Register failed with errors [%s]', JSON.stringify(regResponse.errors))));
+								util.format('fabric-ca request %s failed with errors [%s]', api_method, JSON.stringify(responseObj && responseObj.errors ? responseObj.errors : responseObj))));
 						}
 
 					} catch (err) {
 						reject(new Error(
-							util.format('Could not parse register response [%s] as JSON due to error [%s]', payload, err)));
+							util.format('Could not parse %s response [%s] as JSON due to error [%s]', api_method, payload, err)));
 					}
 				});
 
 			});
 
 			request.on('error', function (err) {
-				reject(new Error(util.format('Calling register endpoint failed with error [%s]', err)));
+				reject(new Error(util.format('Calling %s endpoint failed with error [%s]', api_method, err)));
 			});
 
-			request.write(JSON.stringify(regRequest));
+			request.write(JSON.stringify(requestObj));
 			request.end();
 		});
 	}
 
-	/**
-	 * Generate authorization token required for accessing fabric-cop APIs
-	 * @param {string} privKey The pem-encoded private key used for signing
-	 * @param {string} X509Key The pem-encoded X509 certificate associated with privKey
-	 * @param {string} reqBody The body of the request to sign as part of the token
+	/*
+	 * Generate authorization token required for accessing fabric-ca APIs
 	 */
-	static generateAuthToken(privKey, X509Key, reqBody) {
+	generateAuthToken(reqBody, signingIdentity) {
+		// specific signing procedure is according to:
+		// https://github.com/hyperledger/fabric-ca/blob/master/util/util.go#L213
+		var cert = Buffer.from(signingIdentity._certificate).toString('base64');
+		var body = Buffer.from(JSON.stringify(reqBody)).toString('base64');
 
+		var bodyAndcert = body + '.' + cert;
+		var sig = signingIdentity.sign(bodyAndcert, { hashFunction: this._cryptoPrimitives.hash.bind(this._cryptoPrimitives) });
+		logger.debug(util.format('bodyAndcert: %s', bodyAndcert));
+
+		var b64Sign = Buffer.from(sig, 'hex').toString('base64');
+		return cert + '.' + b64Sign;
 	}
+
+	/**
+	 * @typedef {Object} AttributeRequest
+	 * @property {string} name - The name of the attribute to include in the certificate
+	 * @property {boolean} required - throw an error if the identity does not have the attribute
+	 */
+
+	/**
+	 * @typedef {Object} EnrollmentResponse
+	 * @property {string} enrollmentCert PEM-encoded X509 enrollment certificate
+	 * @property {string} caCertChain PEM-encoded X509 certificate chain for the issuing
+	 * certificate authority
+	 */
 
 	/**
 	 * Enroll a registered user in order to receive a signed X509 certificate
 	 * @param {string} enrollmentID The registered ID to use for enrollment
 	 * @param {string} enrollmentSecret The secret associated with the enrollment ID
 	 * @param {string} csr PEM-encoded PKCS#10 certificate signing request
-	 * @returns {Promise} PEM-encoded X509 certificate
+	 * @param {AttributeRequest[]} attr_reqs An array of {@link AttributeRequest}
+	 * @returns {Promise} {@link EnrollmentResponse}
 	 * @throws Will throw an error if all parameters are not provided
 	 * @throws Will throw an error if calling the enroll API fails for any reason
 	 */
-	enroll(enrollmentID, enrollmentSecret, csr) {
+	enroll(enrollmentID, enrollmentSecret, csr, attr_reqs) {
 
 		var self = this;
 		var numArgs = arguments.length;
@@ -357,12 +717,18 @@ var FabricCAClient = class {
 				path: self._baseAPI + 'enroll',
 				method: 'POST',
 				auth: enrollmentID + ':' + enrollmentSecret,
-				ca: self._ca
+				ca: self._tlsOptions.trustedRoots,
+				rejectUnauthorized: self._tlsOptions.verify
 			};
 
 			var enrollRequest = {
+				caName: self._caName,
 				certificate_request: csr
 			};
+
+			if(attr_reqs) {
+				enrollRequest.attr_reqs = attr_reqs;
+			}
 
 			var request = self._httpClient.request(requestOptions, function (response) {
 
@@ -381,13 +747,17 @@ var FabricCAClient = class {
 					}
 					//response should be JSON
 					try {
-						var enrollResponse = JSON.parse(payload);
-						if (enrollResponse.success) {
+						var res = JSON.parse(payload);
+						if (res.success) {
 							//we want the result field which is Base64-encoded PEM
-							return resolve(new Buffer.from(enrollResponse.result, 'base64').toString());
+							var enrollResponse = new Object();
+							// Cert field is Base64-encoded PEM
+							enrollResponse.enrollmentCert = Buffer.from(res.result.Cert, 'base64').toString();
+							enrollResponse.caCertChain = Buffer.from(res.result.ServerInfo.CAChain, 'base64').toString();
+							return resolve(enrollResponse);
 						} else {
 							return reject(new Error(
-								util.format('Enrollment failed with errors [%s]', JSON.stringify(enrollResponse.errors))));
+								util.format('Enrollment failed with errors [%s]', JSON.stringify(res.errors))));
 						}
 
 					} catch (err) {
@@ -402,7 +772,8 @@ var FabricCAClient = class {
 				reject(new Error(util.format('Calling enrollment endpoint failed with error [%s]', err)));
 			});
 
-			request.write(JSON.stringify(enrollRequest));
+			let body = JSON.stringify(enrollRequest);
+			request.write(body);
 			request.end();
 
 		});
@@ -462,6 +833,31 @@ var FabricCAClient = class {
 
 	}
 };
+
+function checkRegistrar(registrar) {
+	if (typeof registrar === 'undefined' || registrar === null) {
+		throw new Error('Missing required argument "registrar"');
+	}
+
+	if (typeof registrar.getSigningIdentity !== 'function') {
+		throw new Error('Argument "registrar" must be an instance of the class "User", but is found to be missing a method "getSigningIdentity()"');
+	}
+}
+
+// This utility is based on jsrsasign.X509.getSubjectString() implementation
+// we can not use that method directly because it requires calling readCertPEM()
+// first which as of jsrsasign@6.2.3 always assumes RSA based certificates and
+// fails to parse certs that includes ECDSA keys.
+function getSubjectCommonName(pem) {
+	var hex = x509.pemToHex(pem);
+	var d = ASN1HEX.getDecendantHexTLVByNthList(hex, 0, [0, 5]);
+	var subject = x509.hex2dn(d); // format: '/C=US/ST=California/L=San Francisco/CN=Admin@org1.example.com/emailAddress=admin@org1.example.com'
+	var m = subject.match(/CN=.+[^\/]/);
+	if (!m)
+		throw new Error('Certificate PEM does not seem to contain a valid subject with common name "CN"');
+	else
+		return m[0].substring(3);
+}
 
 module.exports = FabricCAServices;
 module.exports.FabricCAClient = FabricCAClient;

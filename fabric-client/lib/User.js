@@ -19,22 +19,22 @@
 var util = require('util');
 var sdkUtils = require('./utils.js');
 var api = require('./api.js');
-var logger = sdkUtils.getLogger('Client.js');
+var logger = sdkUtils.getLogger('User.js');
 var idModule = require('./msp/identity.js');
 var Identity = idModule.Identity;
 var SigningIdentity = idModule.SigningIdentity;
 var Signer = idModule.Signer;
-var MSP = require('./msp/msp.js');
 
 /**
  * The User class represents users that have been enrolled and represented by
  * an enrollment certificate (ECert) and a signing key. The ECert must have
  * been signed by one of the CAs the blockchain network has been configured to trust.
- * An enrolled user (having a signing key and ECert) can conduct chaincode deployments,
- * transactions and queries with the Chain.
+ * An enrolled user (having a signing key and ECert) can conduct chaincode instantiate,
+ * transactions and queries with the Channel.
  *
- * User ECerts can be obtained from a CA beforehand as part of deploying the application,
- * or it can be obtained from the optional Fabric CA service via its enrollment process.
+ * User ECerts can be obtained from a CA beforehand as part of installing and instantiating
+ * the application, or it can be obtained from the optional Fabric CA service via its
+ * enrollment process.
  *
  * Sometimes User identities are confused with Peer identities. User identities represent
  * signing capability because it has access to the private key, while Peer identities in
@@ -49,10 +49,13 @@ var User = class {
 	/**
 	 * Constructor for a member.
 	 *
-	 * @param {string} cfg - The member name or registration request.
-	 * @param {Client} client - The {@link Client} object associated with this member.
+	 * @param {string} cfg - The member name or an object with the following attributes:
+	 *   - enrollmentID {string}: user name
+	 *   - name {string}: user name, if "enrollmentID" is also specified, the "name" is ignored
+	 *   - roles {string[]}: optional. array of roles
+	 *   - affiliation {string}: optional. affiliation with a group or organization
 	 */
-	constructor(cfg, client) {
+	constructor(cfg) {
 		if (util.isString(cfg)) {
 			this._name = cfg;
 			this._roles = null; //string[]
@@ -67,19 +70,8 @@ var User = class {
 		this._enrollmentSecret = '';
 		this._identity = null;
 		this._signingIdentity = null;
-
-		this._client = client;
-
-		this.cryptoPrimitives = client && client.getCryptoSuite() ? client.getCryptoSuite() : sdkUtils.getCryptoSuite();
-
-		// TODO: this should be using config properties obtained from the environment
-		this.mspImpl = new MSP({
-			trustedCerts: [],
-			signer: 'blah',
-			admins: [],
-			id: 'DEFAULT',
-			cryptoSuite: this.cryptoPrimitives
-		});
+		this._mspId = '';
+		this._cryptoSuite = null;
 	}
 
 	/**
@@ -139,12 +131,34 @@ var User = class {
 	}
 
 	/**
+	 * Get the {@link module:api.CryptoSuite} cryptoSuite object for this User instance.
+	 * @returns {module:api.CryptoSuite} the cryptoSuite used to store crypto and key store settings
+	 */
+	getCryptoSuite() {
+		return this._cryptoSuite;
+	}
+
+	/**
+	 * Set the cryptoSuite.
+	 *
+	 * When the application needs to use crypto settings or a key store other than the default,
+	 * it needs to set a cryptoSuite instance that was created with the desired CryptoSuite
+	 * settings and CryptoKeyStore options.
+	 *
+	 * @param {module:api.CryptoSuite} cryptoSuite The cryptoSuite.
+	 */
+	setCryptoSuite(cryptoSuite) {
+		this._cryptoSuite = cryptoSuite;
+	}
+
+	/**
 	 * Set the enrollment object for this User instance
-	 * @param {Key} privateKey the private key object
+	 * @param {module:api.Key} privateKey the private key object
 	 * @param {string} certificate the PEM-encoded string of certificate
+	 * @param {string} mspId The Member Service Provider id for the local signing identity
 	 * @returns {Promise} Promise for successful completion of creating the user's signing Identity
 	 */
-	setEnrollment(privateKey, certificate) {
+	setEnrollment(privateKey, certificate, mspId) {
 		if (typeof privateKey === 'undefined' || privateKey === null || privateKey === '') {
 			throw new Error('Invalid parameter. Must have a valid private key.');
 		}
@@ -153,33 +167,28 @@ var User = class {
 			throw new Error('Invalid parameter. Must have a valid certificate.');
 		}
 
-		return this.cryptoPrimitives.importKey(certificate)
-		.then((pubKey) => {
-			var identity = new Identity('testIdentity', certificate, pubKey, this.mspImpl);
-			this._identity = identity;
-			this._signingIdentity = new SigningIdentity('testSigningIdentity', certificate, pubKey, this.mspImpl, new Signer(this.mspImpl.cryptoSuite, privateKey));
-		});
-	}
-
-	/**
-	 * Get the transaction certificate (tcert) batch size, which is the number of tcerts retrieved
-	 * from member services each time (i.e. in a single batch).
-	 * @returns {int} The tcert batch size.
-	 */
-	getTCertBatchSize() {
-		if (this._tcertBatchSize === undefined) {
-			return this._chain.getTCertBatchSize();
-		} else {
-			return this._tcertBatchSize;
+		if (typeof mspId === 'undefined' || mspId === null || mspId === '') {
+			throw new Error('Invalid parameter. Must have a valid mspId.');
 		}
-	}
 
-	/**
-	 * Set the transaction certificate (tcert) batch size.
-	 * @param {int} batchSize
-	 */
-	setTCertBatchSize(batchSize) {
-		this._tcertBatchSize = batchSize;
+		this._mspId = mspId;
+
+		if (!this._cryptoSuite) {
+			this._cryptoSuite = sdkUtils.newCryptoSuite();
+			this._cryptoSuite.setCryptoKeyStore(sdkUtils.newCryptoKeyStore());
+		}
+		var promise;
+		if (this._cryptoSuite._cryptoKeyStore) {
+			promise = this._cryptoSuite.importKey(certificate);
+		} else {
+			promise = Promise.resolve(this._cryptoSuite.importKey(certificate, {ephemeral: true}));
+		}
+		return promise
+		.then((pubKey) => {
+			var identity = new Identity(certificate, pubKey, mspId, this._cryptoSuite);
+			this._identity = identity;
+			this._signingIdentity = new SigningIdentity(certificate, pubKey, mspId, this._cryptoSuite, new Signer(this._cryptoSuite, privateKey));
+		});
 	}
 
 	/**
@@ -195,7 +204,7 @@ var User = class {
 	 * @return {Member} Promise of the unmarshalled Member object represented by the serialized string
 	 */
 	fromString(str) {
-		logger.debug('Member-fromString --start');
+		logger.debug('fromString --start');
 		var state = JSON.parse(str);
 
 		if (state.name !== this.getName()) {
@@ -207,28 +216,44 @@ var User = class {
 		this._affiliation = state.affiliation;
 		this._enrollmentSecret = state.enrollmentSecret;
 
+		if (typeof state.mspid === 'undefined' || state.mspid === null || state.mspid === '') {
+			throw new Error('Failed to find "mspid" in the deserialized state object for the user. Likely due to an outdated state store.');
+		}
+		this._mspId = state.mspid;
+
+		if (!this._cryptoSuite) {
+			this._cryptoSuite = sdkUtils.newCryptoSuite();
+			this._cryptoSuite.setCryptoKeyStore(sdkUtils.newCryptoKeyStore());
+		}
+
 		var self = this;
 		var pubKey;
 
-		return this.cryptoPrimitives.importKey(state.enrollment.identity.certificate, { algorithm: api.CryptoAlgorithms.X509Certificate })
+		return this._cryptoSuite.importKey(state.enrollment.identity.certificate, { algorithm: api.CryptoAlgorithms.X509Certificate })
 		.then((key) => {
 			pubKey = key;
 
-			var identity = new Identity(state.enrollment.identity.id, state.enrollment.identity.certificate, pubKey, self.mspImpl);
+			var identity = new Identity( state.enrollment.identity.certificate, pubKey, self._mspId, this._cryptoSuite);
 			self._identity = identity;
 
 			// during serialization (see toString() below) only the key's SKI are saved
 			// swap out that for the real key from the crypto provider
-			return self.cryptoPrimitives.getKey(state.enrollment.signingIdentity);
+			return self._cryptoSuite.getKey(state.enrollment.signingIdentity);
 		}).then((privateKey) => {
-			self._signingIdentity = new SigningIdentity(
-				state.enrollment.identity.id,
-				state.enrollment.identity.certificate,
-				pubKey,
-				self.mspImpl,
-				new Signer(self.mspImpl.cryptoSuite, privateKey));
+			// the key retrieved from the key store using the SKI could be a public key
+			// or a private key, check to make sure it's a private key
+			if (privateKey.isPrivate()) {
+				self._signingIdentity = new SigningIdentity(
+					state.enrollment.identity.certificate,
+					pubKey,
+					self._mspId,
+					self._cryptoSuite,
+					new Signer(self._cryptoSuite, privateKey));
 
-			return self;
+				return self;
+			} else {
+				throw new Error(util.format('Private key missing from key store. Can not establish the signing identity for user %s', state.name));
+			}
 		});
 	}
 
@@ -244,13 +269,13 @@ var User = class {
 
 		if (this._identity) {
 			serializedEnrollment.identity = {
-				id: this._identity.getId(),
 				certificate: this._identity._certificate
 			};
 		}
 
 		var state = {
 			name: this._name,
+			mspid: this._mspId,
 			roles: this._roles,
 			affiliation: this._affiliation,
 			enrollmentSecret: this._enrollmentSecret,
@@ -258,6 +283,17 @@ var User = class {
 		};
 
 		return JSON.stringify(state);
+	}
+
+	static isInstance(object) {
+		return (typeof object._name !== 'undefined' &&
+			typeof object._roles !== 'undefined' &&
+			typeof object._affiliation !== 'undefined' &&
+			typeof object._enrollmentSecret !== 'undefined' &&
+			typeof object._identity !== 'undefined' &&
+			typeof object._signingIdentity !== 'undefined' &&
+			typeof object._mspId !== 'undefined' &&
+			typeof object._cryptoSuite !== 'undefined');
 	}
 };
 

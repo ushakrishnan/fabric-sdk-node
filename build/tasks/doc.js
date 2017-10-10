@@ -16,24 +16,31 @@
 
 var gulp = require('gulp');
 var jsdoc = require('gulp-jsdoc3');
+var del = require('del');
 
-gulp.task('doc', function () {
+gulp.task('clean', function(){
+	return del('./docs/gen/**', {force:true});
+});
+
+gulp.task('doc', ['clean'], function () {
 	gulp.src([
-		'README.md',
+		'docs/index.md',
 		'fabric-client/index.js',
-		'fabric-client/lib/api.js',
-		'fabric-client/lib/impl/FileKeyValueStore.js',
-		'fabric-client/lib/impl/CouchDBKeyValueStore.js',
-		'fabric-client/lib/impl/CryptoSuite_ECDSA_AES.js',
-		'fabric-client/lib/impl/ecdsa/key.js',
-		'fabric-client/lib/Chain.js',
-		'fabric-client/lib/Peer.js',
-		'fabric-client/lib/User.js',
-		'fabric-client/lib/Client.js',
-		'fabric-client/lib/X509Certificate.js',
+		'fabric-client/lib/**/*.js',
+		'!fabric-client/lib/protos/**',
+		'!fabric-client/lib/hash.js',
+		'!fabric-client/lib/utils.js',
 		'fabric-ca-client/index.js',
 		'fabric-ca-client/lib/FabricCAClientImpl.js'
-	], {read: false})
-	.pipe(jsdoc())
-	.pipe(gulp.dest('./docs/gen'));
+	], { read: false })
+	.pipe(jsdoc({
+		opts: {
+			tutorials: './docs/tutorials',
+			destination: './docs/gen'
+		},
+		templates: {
+			systemName: 'Hyperledger Fabric SDK for node.js',
+			theme: 'cosmo' //cerulean, cosmo, cyborg, flatly, journal, lumen, paper, readable, sandstone, simplex, slate, spacelab, superhero, united, yeti
+		}
+	}));
 });

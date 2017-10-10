@@ -16,9 +16,17 @@
 
 /**
  * This is the main module for the "fabric-client" package. It provides the convenience
- * APIs to the classes of the package including [Chain]{@link module:api.Chain}
- *
- * @module fabric-client
+ * APIs to the classes of the package including [Channel]{@link module:api.Channel}
+ */
+
+// Using this module to host the couple of "typedef" sections used by api.js
+// because jsdoc3 generator seems to not able to find them in the api.js module
+// likely due to that module containing multiple classes
+
+/**
+ * Options for a key operation
+ * @typedef {Object} KeyOpts
+ * @property {boolean} ephemeral Whether the key should be persisted. "true" to persist.
  */
 
 module.exports = require('./lib/Client.js');
